@@ -7,7 +7,7 @@ import json
 import time
 import euclid
 import traceback
-#import serial
+import serial
 import sys
 import math
 
@@ -33,6 +33,7 @@ valid_ids = ['python-imu']  # which sensor ids can this sensor use? this is not 
 recorders = dict()  # maps recordId => recorder, to hold the curves currently being recorded
 ref_data = euclid.Quaternion(0.0, 0.0, 0.0, 0.0)
 last_data = euclid.Quaternion(0.0, 0.0, 0.0, 0.0)
+recording = False
 
 
 # The following methods are called when service calls are received,
@@ -45,12 +46,16 @@ def list_ids(call, params, resp):
 
 # stores a reference quaternion
 def tare(call, params, resp):
-    global ref_data
-    ref_data = last_data
+    sensor2.tare()
+    sensor3.tare()
+    #global ref_data
+    #ref_data = last_data
 
 
 # starts a new curve recording
 def start_recording(call, params, resp):
+    global recording
+    recording = True
     sensor_id = params[SENSOR_ID_PARAM_NAME]
     step = params.get(STEP_TIME_PARAM_NAME, DEFAULT_STEP_TIME)
     recs = recorders.get(sensor_id, dict())
@@ -62,24 +67,27 @@ def start_recording(call, params, resp):
 
 # stops a previously started curve recording and returns it
 def stop_recording(call, params, resp):
+    global recording
+    recording = False
     sensor_id = params[SENSOR_ID_PARAM_NAME]
     record_id = params[RECORD_ID_PARAM_NAME]
     recs = recorders[sensor_id]
     rec = recs[record_id]
-    del recs[record_id]
     resp[RECORD_DATA_PARAM_NAME] = rec.pack()
+    del recs[record_id]
 
 
 # should be called by the main loop whenever new data is available from the sensor
 def on_sensor_changed(new_data, sensor_id):
     global last_data
+    global recording
     last_data = new_data
-    data = euclid.Quaternion(
-        new_data.w, new_data.x - ref_data.x, new_data.y - ref_data.y,  new_data.z - ref_data.z).normalized()
-    recs = recorders.get(sensor_id, dict())
-    ts = int(time.time() * 1000)  # current time in milliseconds
-    for record_id, rec in recs.iteritems():
-        rec.add(ts, data)
+    if recording:
+        data = new_data.normalized()
+        recs = recorders.get(sensor_id, dict())
+        ts = int(time.time() * 1000)  # current time in milliseconds
+        for record_id, rec in recs.iteritems():
+            rec.add(ts, data)
 
 
 ########
@@ -159,7 +167,7 @@ class ServerThread(threading.Thread):
             s = self._sock
             local_ep = (HOST, PORT_IN)
             s.bind(local_ep)
-            s.settimeout(10.0)
+#            s.settimeout(10.0)
             s.listen(5)
             print('[server] listening on: ' + str(local_ep) + ';')
             while not self._stop.is_set():
@@ -167,7 +175,7 @@ class ServerThread(threading.Thread):
                 try:
                     con, addr = s.accept()
                     print('[server] connection received from: ' + str(addr) + ';')
-                    con.settimeout(10.0)
+#                    con.settimeout(10.0)
                     ConnectionThread(con).start()
                 except:
                     print('[server] timeout')
@@ -197,22 +205,30 @@ class DummyDataThread(threading.Thread):
             on_sensor_changed(q, sensor_id)
             time.sleep(0.015)
 
+class DataThread(threading.Thread):
+    def __init__(self):
+        threading.Thread.__init__(self)
+        self._stop = threading.Event()
+    def stop(self):
+        self._stop.set()
 
-#### THE SERVER THREAD SHOULD BE HERE
-server_thread = ServerThread()
-server_thread.start()
-dummy_thread = DummyDataThread(2) # 2 turns per second
-dummy_thread.start()
+    def run(self):
+        while not self._stop.is_set():
+            q = sensor2.listen_streaming()
+            if q is not None:
+                try:
+                    sensor_id = valid_ids[0]
+                    q = euclid.Quaternion(float(q[4]), float(q[1]), float(q[2]), float(q[3]))
+                    on_sensor_changed(q, sensor_id)
+                    time.sleep(0.2)
+                except ValueError:
+                    print "Invalid sensor data"
+                    continue
 
-i = raw_input('to stop, press any key...\n')
-server_thread.stop()
-dummy_thread.stop()
-exit(0)
 
-#### THE MAIN IMU LOOP SHOULD BE HERE
-serial_port = serial.Serial(imu.get_port(),timeout=1,baudrate=115200)
-sensor3 = imu.IMU(serial_port, 3)
-sensor2 = imu.IMU(serial_port, 2)
+serial_port = serial.Serial("COM7",timeout=1,baudrate=115200)
+sensor3 = imu.IMU(serial_port, 0)
+sensor2 = imu.IMU(serial_port, 5)
 
 # serial_port = serial.Serial('COM10', timeout=1)
 sensor2.calibrate()
@@ -224,10 +240,14 @@ sensor3.reset_timestamp()
 sensor3.startStreaming()
 sensor2.startStreaming()
 
-running = True
-while running:
-    q = sensor2.listen_streaming()
-    if q is not None:
-        sensor_id = q[0]
-        q = euclid.Quaternion(q[4], q[1], q[2], q[3])
-        on_sensor_changed(q, sensor_id)
+#### THE SERVER THREAD SHOULD BE HERE
+server_thread = ServerThread()
+server_thread.start()
+data_thread = DataThread()
+data_thread.start()
+
+i = raw_input('to stop, press any key...\n')
+server_thread.stop()
+data_thread.stop()
+exit(0)
+
